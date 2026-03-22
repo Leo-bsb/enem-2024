@@ -8,14 +8,14 @@ import streamlit as st
 import polars as pl
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import pandas as pd
 import numpy as np
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 import os
+import sys
 
 # ============================================================================
-# CONFIGURAÇÃO DA PÁGINA
+# CONFIGURAÇÃO DA PÁGINA (DEVE SER A PRIMEIRA CHAMADA)
 # ============================================================================
 
 st.set_page_config(
@@ -47,12 +47,6 @@ st.markdown("""
         border-bottom: 2px solid #3498db;
         padding-bottom: 0.5rem;
     }
-    .metric-card {
-        background-color: #f8f9fa;
-        border-radius: 10px;
-        padding: 1.5rem;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    }
     .insight-box {
         background-color: #e8f4f8;
         border-left: 4px solid #3498db;
@@ -74,6 +68,13 @@ st.markdown("""
         margin: 1rem 0;
         border-radius: 4px;
     }
+    .error-box {
+        background-color: #f8d7da;
+        border-left: 4px solid #dc3545;
+        padding: 1rem;
+        margin: 1rem 0;
+        border-radius: 4px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -81,34 +82,69 @@ st.markdown("""
 # CONFIGURAÇÃO DO BANCO DE DADOS
 # ============================================================================
 
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def get_database_engine():
     """Cria e retorna engine do banco de dados"""
-    # Você pode usar variáveis de ambiente para segurança em produção
-    DB_CONFIG = {
-        'host': os.getenv('DB_HOST', 'bigdata.dataiesb.com'),
-        'database': os.getenv('DB_NAME', 'iesb'),
-        'user': os.getenv('DB_USER', 'data_iesb'),
-        'password': os.getenv('DB_PASSWORD', 'iesb'),
-        'port': os.getenv('DB_PORT', '5432')
-    }
-    
-    connection_string = f"postgresql://{DB_CONFIG['user']}:{DB_CONFIG['password']}@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}"
-    engine = create_engine(connection_string)
-    
-    return engine
+    try:
+        # Tentar usar secrets do Streamlit Cloud primeiro
+        if hasattr(st, 'secrets') and 'DB_HOST' in st.secrets:
+            DB_CONFIG = {
+                'host': st.secrets["DB_HOST"],
+                'database': st.secrets["DB_NAME"],
+                'user': st.secrets["DB_USER"],
+                'password': st.secrets["DB_PASSWORD"],
+                'port': st.secrets.get("DB_PORT", "5432")
+            }
+        else:
+            # Fallback para variáveis de ambiente ou valores padrão
+            DB_CONFIG = {
+                'host': os.getenv('DB_HOST', 'bigdata.dataiesb.com'),
+                'database': os.getenv('DB_NAME', 'iesb'),
+                'user': os.getenv('DB_USER', 'data_iesb'),
+                'password': os.getenv('DB_PASSWORD', 'iesb'),
+                'port': os.getenv('DB_PORT', '5432')
+            }
+        
+        connection_string = f"postgresql://{DB_CONFIG['user']}:{DB_CONFIG['password']}@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}"
+        
+        # Criar engine com configurações otimizadas
+        engine = create_engine(
+            connection_string,
+            pool_pre_ping=True,
+            pool_recycle=3600,
+            connect_args={
+                "connect_timeout": 10,
+                "options": "-c statement_timeout=30000"
+            }
+        )
+        
+        # Testar conexão
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        
+        return engine
+        
+    except Exception as e:
+        st.error(f"❌ Erro ao conectar ao banco de dados: {str(e)}")
+        return None
 
 # ============================================================================
 # FUNÇÕES DE CARREGAMENTO DE DADOS
 # ============================================================================
 
-@st.cache_data(ttl=3600)  # Cache por 1 hora
+@st.cache_data(ttl=3600, show_spinner=False)
 def carregar_dados():
     """Carrega e faz join dos dados do ENEM usando Polars"""
     
     engine = get_database_engine()
     
-    with st.spinner('🔄 Carregando dados do banco de dados...'):
+    if engine is None:
+        return None
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    try:
         # Query otimizada para participantes
         query_participantes = """
         SELECT 
@@ -121,6 +157,7 @@ def carregar_dados():
             sg_uf_prova,
             q001 as renda_familiar
         FROM public.ed_enem_2024_participantes
+        LIMIT 100000
         """
         
         # Query otimizada para resultados
@@ -133,101 +170,128 @@ def carregar_dados():
             nota_media_5_notas
         FROM public.ed_enem_2024_resultados
         WHERE nota_media_5_notas IS NOT NULL
+        LIMIT 100000
         """
         
-        try:
-            # Carregar dados em chunks e processar
-            st.info("📥 Carregando participantes...")
-            df_participantes = pl.read_database(
-                query=query_participantes,
-                connection=engine
-            )
-            
-            st.info("📥 Carregando resultados...")
-            df_resultados = pl.read_database(
-                query=query_resultados,
-                connection=engine
-            )
-            
-            # Otimizar tipos de dados
-            st.info("⚙️ Otimizando tipos de dados...")
-            
-            # Converter strings para categorical
-            for col in df_participantes.columns:
-                if df_participantes[col].dtype == pl.Utf8:
-                    df_participantes = df_participantes.with_columns(
-                        pl.col(col).cast(pl.Categorical)
-                    )
-            
-            for col in df_resultados.columns:
-                if df_resultados[col].dtype == pl.Utf8:
-                    df_resultados = df_resultados.with_columns(
-                        pl.col(col).cast(pl.Categorical)
-                    )
-            
-            # Converter idade para Int32
-            if "idade_calculada" in df_participantes.columns:
+        # Carregar participantes
+        status_text.text("📥 Carregando participantes...")
+        progress_bar.progress(20)
+        
+        df_participantes = pl.read_database(
+            query=query_participantes,
+            connection=engine
+        )
+        
+        # Carregar resultados
+        status_text.text("📥 Carregando resultados...")
+        progress_bar.progress(40)
+        
+        df_resultados = pl.read_database(
+            query=query_resultados,
+            connection=engine
+        )
+        
+        # Otimizar tipos de dados
+        status_text.text("⚙️ Otimizando tipos de dados...")
+        progress_bar.progress(60)
+        
+        # Converter strings para categorical
+        for col in df_participantes.columns:
+            if df_participantes[col].dtype == pl.Utf8:
                 df_participantes = df_participantes.with_columns(
-                    pl.col("idade_calculada").cast(pl.Int32, strict=False)
+                    pl.col(col).cast(pl.Categorical)
                 )
-            
-            st.info("🔗 Fazendo join dos dados...")
-            
-            # Join dos dados
-            df_completo = df_participantes.join(
-                df_resultados,
-                left_on="nu_inscricao",
-                right_on="nu_sequencial",
-                how="inner"
+        
+        for col in df_resultados.columns:
+            if df_resultados[col].dtype == pl.Utf8:
+                df_resultados = df_resultados.with_columns(
+                    pl.col(col).cast(pl.Categorical)
+                )
+        
+        # Converter idade para Int32
+        if "idade_calculada" in df_participantes.columns:
+            df_participantes = df_participantes.with_columns(
+                pl.col("idade_calculada").cast(pl.Int32, strict=False)
             )
-            
-            st.success(f"✅ Dados carregados com sucesso! Total de registros: {len(df_completo):,}")
-            
-            return df_completo
-            
-        except Exception as e:
-            st.error(f"❌ Erro ao carregar dados: {e}")
-            st.info("💡 Verifique a conexão com o banco de dados e as credenciais.")
-            return None
+        
+        # Join dos dados
+        status_text.text("🔗 Fazendo join dos dados...")
+        progress_bar.progress(80)
+        
+        df_completo = df_participantes.join(
+            df_resultados,
+            left_on="nu_inscricao",
+            right_on="nu_sequencial",
+            how="inner"
+        )
+        
+        progress_bar.progress(100)
+        status_text.text(f"✅ Dados carregados! Total: {len(df_completo):,} registros")
+        
+        # Limpar widgets de progresso após 2 segundos
+        import time
+        time.sleep(2)
+        progress_bar.empty()
+        status_text.empty()
+        
+        return df_completo
+        
+    except Exception as e:
+        progress_bar.empty()
+        status_text.empty()
+        st.error(f"❌ Erro ao carregar dados: {str(e)}")
+        st.info("💡 Dica: Verifique se as tabelas existem e se você tem permissão de acesso.")
+        return None
 
-@st.cache_data
+@st.cache_data(show_spinner=False)
 def calcular_estatisticas_descritivas(_df):
     """Calcula estatísticas descritivas para variáveis numéricas"""
     variaveis = ['nota_mt_matematica', 'nota_redacao', 'nota_media_5_notas', 'idade_calculada']
     
     stats = {}
     for var in variaveis:
-        stats[var] = {
-            'count': _df[var].count(),
-            'mean': _df[var].mean(),
-            'std': _df[var].std(),
-            'min': _df[var].min(),
-            'q1': _df[var].quantile(0.25),
-            'median': _df[var].median(),
-            'q3': _df[var].quantile(0.75),
-            'max': _df[var].max(),
-            'cv': (_df[var].std() / _df[var].mean() * 100) if _df[var].mean() != 0 else 0
-        }
+        try:
+            stats[var] = {
+                'count': _df[var].count(),
+                'mean': _df[var].mean(),
+                'std': _df[var].std(),
+                'min': _df[var].min(),
+                'q1': _df[var].quantile(0.25),
+                'median': _df[var].median(),
+                'q3': _df[var].quantile(0.75),
+                'max': _df[var].max(),
+                'cv': (_df[var].std() / _df[var].mean() * 100) if _df[var].mean() != 0 else 0
+            }
+        except Exception as e:
+            st.warning(f"Erro ao calcular estatísticas para {var}: {e}")
+            stats[var] = {
+                'count': 0, 'mean': 0, 'std': 0, 'min': 0, 
+                'q1': 0, 'median': 0, 'q3': 0, 'max': 0, 'cv': 0
+            }
     
     return stats
 
-@st.cache_data
+@st.cache_data(show_spinner=False)
 def calcular_tabelas_frequencia(_df):
     """Calcula tabelas de frequência para variáveis categóricas"""
     variaveis = ['tp_sexo', 'tp_faixa_etaria', 'tp_cor_raca', 'sg_uf_prova', 'renda_familiar']
     
     tabelas = {}
     for var in variaveis:
-        freq = (_df
-            .group_by(var)
-            .agg(pl.len().alias('frequencia'))
-            .with_columns([
-                (pl.col('frequencia') / pl.col('frequencia').sum() * 100).alias('percentual'),
-                (pl.col('frequencia').cum_sum() / pl.col('frequencia').sum() * 100).alias('perc_acumulado')
-            ])
-            .sort('frequencia', descending=True))
-        
-        tabelas[var] = freq
+        try:
+            freq = (_df
+                .group_by(var)
+                .agg(pl.len().alias('frequencia'))
+                .with_columns([
+                    (pl.col('frequencia') / pl.col('frequencia').sum() * 100).alias('percentual'),
+                    (pl.col('frequencia').cum_sum() / pl.col('frequencia').sum() * 100).alias('perc_acumulado')
+                ])
+                .sort('frequencia', descending=True))
+            
+            tabelas[var] = freq
+        except Exception as e:
+            st.warning(f"Erro ao calcular frequências para {var}: {e}")
+            tabelas[var] = pl.DataFrame()
     
     return tabelas
 
@@ -241,12 +305,25 @@ st.sidebar.markdown("---")
 
 # Status da conexão
 with st.sidebar:
-    try:
+    with st.spinner("🔄 Testando conexão..."):
         engine = get_database_engine()
-        st.success("✅ Conectado ao banco")
-    except Exception as e:
-        st.error("❌ Erro na conexão")
-        st.stop()
+        if engine is not None:
+            st.success("✅ Conectado ao banco")
+        else:
+            st.error("❌ Erro na conexão")
+            st.markdown("""
+            <div class="error-box">
+            <h4>Erro de Conexão</h4>
+            <p>Não foi possível conectar ao banco de dados.</p>
+            <p><strong>Possíveis causas:</strong></p>
+            <ul>
+                <li>Credenciais incorretas</li>
+                <li>Banco indisponível</li>
+                <li>Firewall bloqueando conexão</li>
+            </ul>
+            </div>
+            """, unsafe_allow_html=True)
+            st.stop()
 
 pagina = st.sidebar.radio(
     "Navegação",
@@ -254,11 +331,7 @@ pagina = st.sidebar.radio(
         "🏠 Visão Geral",
         "📊 Distribuições de Frequência",
         "📈 Variáveis Qualitativas",
-        "📉 Variáveis Quantitativas",
-        "📦 Box Plots",
-        "🔗 Análise de Correlação",
-        "🎯 Análises Cruzadas",
-        "📋 Relatório Completo"
+        "📉 Variáveis Quantitativas"
     ]
 )
 
@@ -274,23 +347,29 @@ st.sidebar.markdown("""
 **Fonte dos Dados:**
 - PostgreSQL (bigdata.dataiesb.com)
 - Tabelas: ed_enem_2024_*
-- Atualização: Tempo real
+- Cache: 1 hora
 """)
 
 # ============================================================================
 # CARREGAR DADOS
 # ============================================================================
 
-df_completo = carregar_dados()
+with st.spinner('🔄 Carregando dados do banco...'):
+    df_completo = carregar_dados()
 
 if df_completo is None:
-    st.error("⚠️ Não foi possível carregar os dados. Verifique a conexão com o banco de dados.")
+    st.error("⚠️ Não foi possível carregar os dados.")
+    st.info("💡 Verifique a conexão com o banco de dados e tente recarregar.")
     st.stop()
 
-# Calcular estatísticas uma vez
-with st.spinner('📊 Calculando estatísticas...'):
-    stats = calcular_estatisticas_descritivas(df_completo)
-    tabelas_freq = calcular_tabelas_frequencia(df_completo)
+# Calcular estatísticas
+try:
+    with st.spinner('📊 Calculando estatísticas...'):
+        stats = calcular_estatisticas_descritivas(df_completo)
+        tabelas_freq = calcular_tabelas_frequencia(df_completo)
+except Exception as e:
+    st.error(f"Erro ao calcular estatísticas: {e}")
+    st.stop()
 
 # ============================================================================
 # PÁGINA 1: VISÃO GERAL
@@ -317,7 +396,7 @@ if pagina == "🏠 Visão Geral":
     
     with col2:
         st.metric(
-            label="✅ Com Resultados",
+            label="✅ Dados Carregados",
             value=f"{total_resultados:,}".replace(',', '.')
         )
     
@@ -329,8 +408,8 @@ if pagina == "🏠 Visão Geral":
     
     with col4:
         st.metric(
-            label="❌ Ausências",
-            value=f"{ausencias:,}".replace(',', '.')
+            label="⚡ Cache",
+            value="1 hora"
         )
     
     st.markdown("---")
@@ -363,37 +442,16 @@ if pagina == "🏠 Visão Geral":
     
     st.markdown("---")
     
-    # Insights principais
+    # Insights
     st.markdown('<div class="sub-header">💡 Principais Insights</div>', unsafe_allow_html=True)
-    
-    st.markdown("""
-    <div class="insight-box">
-    <h4>✓ Perfil Demográfico</h4>
-    <ul>
-        <li>Predominância feminina: <strong>60,57%</strong> vs <strong>39,43%</strong> masculino</li>
-        <li>Diferença de aproximadamente <strong>916.298</strong> inscrições</li>
-    </ul>
-    </div>
-    """, unsafe_allow_html=True)
     
     st.markdown("""
     <div class="success-box">
     <h4>✓ Desempenho Geral</h4>
     <ul>
-        <li><strong>Redação</strong> apresenta a maior média (634,67) mas também a maior variabilidade (CV=32,95%)</li>
-        <li><strong>Matemática</strong> tem o menor desempenho médio (527,08) com assimetria positiva</li>
+        <li><strong>Redação</strong> apresenta a maior média mas também a maior variabilidade (CV=32,95%)</li>
+        <li><strong>Matemática</strong> tem o menor desempenho médio com assimetria positiva</li>
         <li><strong>Nota Média</strong> é a mais concentrada e simétrica (CV=16,93%)</li>
-    </ul>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    st.markdown("""
-    <div class="warning-box">
-    <h4>⚠️ Pontos de Atenção</h4>
-    <ul>
-        <li>Alta taxa de ausência: <strong>30,99%</strong> dos inscritos não compareceram</li>
-        <li>Matemática apresenta concentração de candidatos abaixo da média</li>
-        <li>Necessário investigar desigualdades por cor/raça, renda e região</li>
     </ul>
     </div>
     """, unsafe_allow_html=True)
@@ -407,7 +465,6 @@ elif pagina == "📊 Distribuições de Frequência":
     
     st.markdown("---")
     
-    # Seletor de variável
     variavel = st.selectbox(
         "Selecione a variável categórica:",
         ['tp_sexo', 'tp_faixa_etaria', 'tp_cor_raca', 'sg_uf_prova', 'renda_familiar'],
@@ -420,51 +477,33 @@ elif pagina == "📊 Distribuições de Frequência":
         }[x]
     )
     
-    # Mostrar tabela
     st.markdown(f'<div class="sub-header">📋 Distribuição: {variavel.replace("_", " ").title()}</div>', unsafe_allow_html=True)
     
-    df_freq = tabelas_freq[variavel].to_pandas()
-    
-    # Formatar tabela
-    df_freq['frequencia'] = df_freq['frequencia'].apply(lambda x: f"{x:,}".replace(',', '.'))
-    df_freq['percentual'] = df_freq['percentual'].apply(lambda x: f"{x:.2f}%")
-    df_freq['perc_acumulado'] = df_freq['perc_acumulado'].apply(lambda x: f"{x:.2f}%")
-    
-    # Renomear colunas
-    df_freq = df_freq.rename(columns={
-        variavel: 'Categoria',
-        'frequencia': 'Frequência',
-        'percentual': 'Percentual (%)',
-        'perc_acumulado': 'Percentual Acumulado (%)'
-    })
-    
-    st.dataframe(df_freq, use_container_width=True, height=400)
-    
-    # Estatísticas da distribuição
-    st.markdown("---")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.metric("Total de Categorias", len(df_freq))
-    
-    with col2:
-        categoria_mais_frequente = df_freq.iloc[0]['Categoria']
-        st.metric("Categoria Mais Frequente", categoria_mais_frequente)
-    
-    with col3:
-        perc_mais_frequente = df_freq.iloc[0]['Percentual (%)']
-        st.metric("Percentual", perc_mais_frequente)
-    
-    # Download da tabela
-    st.markdown("---")
-    csv = df_freq.to_csv(index=False)
-    st.download_button(
-        label="📥 Download da Tabela (CSV)",
-        data=csv,
-        file_name=f"distribuicao_{variavel}.csv",
-        mime="text/csv"
-    )
+    if len(tabelas_freq[variavel]) > 0:
+        df_freq = tabelas_freq[variavel].to_pandas()
+        
+        df_freq['frequencia'] = df_freq['frequencia'].apply(lambda x: f"{x:,}".replace(',', '.'))
+        df_freq['percentual'] = df_freq['percentual'].apply(lambda x: f"{x:.2f}%")
+        df_freq['perc_acumulado'] = df_freq['perc_acumulado'].apply(lambda x: f"{x:.2f}%")
+        
+        df_freq = df_freq.rename(columns={
+            variavel: 'Categoria',
+            'frequencia': 'Frequência',
+            'percentual': 'Percentual (%)',
+            'perc_acumulado': 'Percentual Acumulado (%)'
+        })
+        
+        st.dataframe(df_freq, use_container_width=True, height=400)
+        
+        csv = df_freq.to_csv(index=False)
+        st.download_button(
+            label="📥 Download CSV",
+            data=csv,
+            file_name=f"distribuicao_{variavel}.csv",
+            mime="text/csv"
+        )
+    else:
+        st.warning("Nenhum dado disponível para esta variável.")
 
 # ============================================================================
 # PÁGINA 3: VARIÁVEIS QUALITATIVAS
@@ -475,7 +514,6 @@ elif pagina == "📈 Variáveis Qualitativas":
     
     st.markdown("---")
     
-    # Seletor de variável
     variavel = st.selectbox(
         "Selecione a variável:",
         ['tp_sexo', 'tp_faixa_etaria', 'tp_cor_raca', 'sg_uf_prova', 'renda_familiar'],
@@ -488,7 +526,6 @@ elif pagina == "📈 Variáveis Qualitativas":
         }[x]
     )
     
-    # Tipo de gráfico
     tipo_grafico = st.radio(
         "Tipo de gráfico:",
         ["Barras Verticais", "Barras Horizontais", "Pizza"],
@@ -497,76 +534,55 @@ elif pagina == "📈 Variáveis Qualitativas":
     
     st.markdown("---")
     
-    # Preparar dados
-    df_freq = tabelas_freq[variavel].to_pandas()
-    
-    # Limitar top para UF
-    if variavel == 'sg_uf_prova' and len(df_freq) > 10:
-        mostrar_top = st.slider("Mostrar Top N estados:", 5, 27, 10)
-        df_freq = df_freq.head(mostrar_top)
-    
-    # Criar gráfico
-    if tipo_grafico == "Barras Verticais":
-        fig = px.bar(
-            df_freq,
-            x=variavel,
-            y='frequencia',
-            title=f'Distribuição por {variavel.replace("_", " ").title()} - ENEM 2024',
-            labels={variavel: variavel.replace('_', ' ').title(), 'frequencia': 'Quantidade'},
-            color='frequencia',
-            color_continuous_scale='Blues',
-            text='frequencia'
-        )
-        fig.update_traces(texttemplate='%{text:,.0f}', textposition='outside')
-        fig.update_xaxis(tickangle=45)
+    if len(tabelas_freq[variavel]) > 0:
+        df_freq = tabelas_freq[variavel].to_pandas()
         
-    elif tipo_grafico == "Barras Horizontais":
-        fig = px.bar(
-            df_freq,
-            y=variavel,
-            x='frequencia',
-            orientation='h',
-            title=f'Distribuição por {variavel.replace("_", " ").title()} - ENEM 2024',
-            labels={variavel: variavel.replace('_', ' ').title(), 'frequencia': 'Quantidade'},
-            color='frequencia',
-            color_continuous_scale='Blues',
-            text='frequencia'
-        )
-        fig.update_traces(texttemplate='%{text:,.0f}', textposition='outside')
+        if variavel == 'sg_uf_prova' and len(df_freq) > 10:
+            mostrar_top = st.slider("Mostrar Top N estados:", 5, min(27, len(df_freq)), 10)
+            df_freq = df_freq.head(mostrar_top)
         
-    else:  # Pizza
-        fig = px.pie(
-            df_freq,
-            values='frequencia',
-            names=variavel,
-            title=f'Distribuição por {variavel.replace("_", " ").title()} - ENEM 2024',
-            hole=0.4
-        )
-        fig.update_traces(textposition='inside', textinfo='percent+label')
-    
-    fig.update_layout(height=600)
-    st.plotly_chart(fig, use_container_width=True)
-    
-    # Estatísticas
-    st.markdown("---")
-    st.markdown('<div class="sub-header">📊 Estatísticas da Distribuição</div>', unsafe_allow_html=True)
-    
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric("Categorias", len(tabelas_freq[variavel]))
-    
-    with col2:
-        total = df_freq['frequencia'].sum()
-        st.metric("Total", f"{int(total):,}".replace(',', '.'))
-    
-    with col3:
-        max_freq = df_freq['frequencia'].max()
-        st.metric("Máx. Frequência", f"{int(max_freq):,}".replace(',', '.'))
-    
-    with col4:
-        min_freq = df_freq['frequencia'].min()
-        st.metric("Mín. Frequência", f"{int(min_freq):,}".replace(',', '.'))
+        if tipo_grafico == "Barras Verticais":
+            fig = px.bar(
+                df_freq,
+                x=variavel,
+                y='frequencia',
+                title=f'Distribuição por {variavel.replace("_", " ").title()}',
+                labels={variavel: variavel.replace('_', ' ').title(), 'frequencia': 'Quantidade'},
+                color='frequencia',
+                color_continuous_scale='Blues',
+                text='frequencia'
+            )
+            fig.update_traces(texttemplate='%{text:,.0f}', textposition='outside')
+            fig.update_xaxis(tickangle=45)
+            
+        elif tipo_grafico == "Barras Horizontais":
+            fig = px.bar(
+                df_freq,
+                y=variavel,
+                x='frequencia',
+                orientation='h',
+                title=f'Distribuição por {variavel.replace("_", " ").title()}',
+                labels={variavel: variavel.replace('_', ' ').title(), 'frequencia': 'Quantidade'},
+                color='frequencia',
+                color_continuous_scale='Blues',
+                text='frequencia'
+            )
+            fig.update_traces(texttemplate='%{text:,.0f}', textposition='outside')
+            
+        else:
+            fig = px.pie(
+                df_freq,
+                values='frequencia',
+                names=variavel,
+                title=f'Distribuição por {variavel.replace("_", " ").title()}',
+                hole=0.4
+            )
+            fig.update_traces(textposition='inside', textinfo='percent+label')
+        
+        fig.update_layout(height=600)
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.warning("Nenhum dado disponível para esta variável.")
 
 # ============================================================================
 # PÁGINA 4: VARIÁVEIS QUANTITATIVAS
@@ -577,7 +593,6 @@ elif pagina == "📉 Variáveis Quantitativas":
     
     st.markdown("---")
     
-    # Seletor de variável
     variavel = st.selectbox(
         "Selecione a variável:",
         ['nota_mt_matematica', 'nota_redacao', 'nota_media_5_notas', 'idade_calculada'],
@@ -589,8 +604,7 @@ elif pagina == "📉 Variáveis Quantitativas":
         }[x]
     )
     
-    # Tabs para diferentes visualizações
-    tab1, tab2, tab3 = st.tabs(["📊 Estatísticas Descritivas", "📈 Histograma", "📉 Análise de Quartis"])
+    tab1, tab2 = st.tabs(["📊 Estatísticas", "📈 Histograma"])
     
     with tab1:
         st.markdown('<div class="sub-header">📊 Estatísticas Descritivas</div>', unsafe_allow_html=True)
@@ -598,168 +612,49 @@ elif pagina == "📉 Variáveis Quantitativas":
         col1, col2 = st.columns(2)
         
         with col1:
-            st.markdown("### Medidas de Tendência Central")
+            st.markdown("### Tendência Central")
             st.metric("Média", f"{stats[variavel]['mean']:.2f}")
-            st.metric("Mediana (Q2)", f"{stats[variavel]['median']:.2f}")
+            st.metric("Mediana", f"{stats[variavel]['median']:.2f}")
             
-            st.markdown("### Medidas de Dispersão")
+            st.markdown("### Dispersão")
             st.metric("Desvio Padrão", f"{stats[variavel]['std']:.2f}")
-            st.metric("Coef. Variação (CV)", f"{stats[variavel]['cv']:.2f}%")
+            st.metric("CV", f"{stats[variavel]['cv']:.2f}%")
             
         with col2:
-            st.markdown("### Valores Extremos")
+            st.markdown("### Extremos")
             st.metric("Mínimo", f"{stats[variavel]['min']:.2f}")
             st.metric("Máximo", f"{stats[variavel]['max']:.2f}")
-            st.metric("Amplitude", f"{stats[variavel]['max'] - stats[variavel]['min']:.2f}")
             
             st.markdown("### Quartis")
-            st.metric("Q1 (25%)", f"{stats[variavel]['q1']:.2f}")
-            st.metric("Q3 (75%)", f"{stats[variavel]['q3']:.2f}")
-            st.metric("IQR (Q3-Q1)", f"{stats[variavel]['q3'] - stats[variavel]['q1']:.2f}")
-        
-        # Análise de assimetria
-        st.markdown("---")
-        assimetria = (stats[variavel]['mean'] - stats[variavel]['median']) / stats[variavel]['std']
-        
-        if abs(assimetria) < 0.1:
-            tipo_assimetria = "Distribuição Simétrica"
-            cor = "success-box"
-        elif assimetria > 0:
-            tipo_assimetria = "Assimetria Positiva (cauda à direita)"
-            cor = "warning-box"
-        else:
-            tipo_assimetria = "Assimetria Negativa (cauda à esquerda)"
-            cor = "warning-box"
-        
-        st.markdown(f"""
-        <div class="{cor}">
-        <h4>📊 Análise de Assimetria</h4>
-        <p><strong>Coeficiente de Assimetria (Pearson):</strong> {assimetria:.3f}</p>
-        <p><strong>Interpretação:</strong> {tipo_assimetria}</p>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Outliers
-        iqr = stats[variavel]['q3'] - stats[variavel]['q1']
-        limite_inf = stats[variavel]['q1'] - 1.5 * iqr
-        limite_sup = stats[variavel]['q3'] + 1.5 * iqr
-        
-        st.markdown(f"""
-        <div class="insight-box">
-        <h4>🔍 Análise de Outliers (Método IQR)</h4>
-        <p><strong>Limite Inferior:</strong> {limite_inf:.2f}</p>
-        <p><strong>Limite Superior:</strong> {limite_sup:.2f}</p>
-        <p><em>Valores fora destes limites são considerados outliers.</em></p>
-        </div>
-        """, unsafe_allow_html=True)
+            st.metric("Q1", f"{stats[variavel]['q1']:.2f}")
+            st.metric("Q3", f"{stats[variavel]['q3']:.2f}")
     
     with tab2:
         st.markdown('<div class="sub-header">📈 Histograma</div>', unsafe_allow_html=True)
         
-        # Controles do histograma
-        col1, col2 = st.columns(2)
-        with col1:
-            nbins = st.slider("Número de bins:", 20, 100, 50)
-        with col2:
-            mostrar_estatisticas = st.checkbox("Mostrar linhas de média e mediana", value=True)
+        nbins = st.slider("Número de bins:", 20, 100, 50)
         
-        # Criar histograma
         df_pandas = df_completo.to_pandas()
         
         fig = px.histogram(
             df_pandas,
             x=variavel,
             nbins=nbins,
-            title=f'Distribuição: {variavel.replace("_", " ").title()} - ENEM 2024',
+            title=f'Distribuição: {variavel.replace("_", " ").title()}',
             labels={variavel: variavel.replace('_', ' ').title()},
             color_discrete_sequence=['#3498db'],
             marginal='box'
         )
         
-        if mostrar_estatisticas:
-            # Linha da média
-            fig.add_vline(
-                x=stats[variavel]['mean'],
-                line_dash="dash",
-                line_color="red",
-                annotation_text=f"Média: {stats[variavel]['mean']:.2f}",
-                annotation_position="top right"
-            )
-            
-            # Linha da mediana
-            fig.add_vline(
-                x=stats[variavel]['median'],
-                line_dash="dash",
-                line_color="green",
-                annotation_text=f"Mediana: {stats[variavel]['median']:.2f}",
-                annotation_position="bottom right"
-            )
-        
-        fig.update_layout(
-            showlegend=False,
-            height=600,
-            yaxis_title='Frequência',
-            bargap=0.05
+        fig.add_vline(
+            x=stats[variavel]['mean'],
+            line_dash="dash",
+            line_color="red",
+            annotation_text=f"Média: {stats[variavel]['mean']:.2f}"
         )
         
+        fig.update_layout(showlegend=False, height=600, bargap=0.05)
         st.plotly_chart(fig, use_container_width=True)
-    
-    with tab3:
-        st.markdown('<div class="sub-header">📉 Análise de Quartis</div>', unsafe_allow_html=True)
-        
-        # Visualização de quartis
-        quartis_data = pd.DataFrame({
-            'Quartil': ['Mínimo', 'Q1 (25%)', 'Q2/Mediana (50%)', 'Q3 (75%)', 'Máximo'],
-            'Valor': [
-                stats[variavel]['min'],
-                stats[variavel]['q1'],
-                stats[variavel]['median'],
-                stats[variavel]['q3'],
-                stats[variavel]['max']
-            ],
-            'Percentual': ['0%', '25%', '50%', '75%', '100%']
-        })
-        
-        fig = go.Figure()
-        
-        fig.add_trace(go.Bar(
-            x=quartis_data['Quartil'],
-            y=quartis_data['Valor'],
-            text=quartis_data['Valor'].apply(lambda x: f'{x:.2f}'),
-            textposition='outside',
-            marker_color=['#e74c3c', '#f39c12', '#3498db', '#f39c12', '#e74c3c']
-        ))
-        
-        fig.update_layout(
-            title=f'Distribuição de Quartis: {variavel.replace("_", " ").title()}',
-            xaxis_title='Quartil',
-            yaxis_title='Valor',
-            height=500,
-            showlegend=False
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Interpretação
-        st.markdown(f"""
-        <div class="insight-box">
-        <h4>📊 Interpretação dos Quartis</h4>
-        <ul>
-            <li><strong>25% dos candidatos</strong> tiraram até <strong>{stats[variavel]['q1']:.2f}</strong> pontos</li>
-            <li><strong>50% dos candidatos</strong> tiraram até <strong>{stats[variavel]['median']:.2f}</strong> pontos (mediana)</li>
-            <li><strong>75% dos candidatos</strong> tiraram até <strong>{stats[variavel]['q3']:.2f}</strong> pontos</li>
-            <li><strong>50% centrais</strong> estão entre <strong>{stats[variavel]['q1']:.2f}</strong> e <strong>{stats[variavel]['q3']:.2f}</strong> (IQR = {stats[variavel]['q3'] - stats[variavel]['q1']:.2f})</li>
-        </ul>
-        </div>
-        """, unsafe_allow_html=True)
-
-# ============================================================================
-# RESTANTE DAS PÁGINAS (Box Plots, Correlação, Análises Cruzadas, Relatório)
-# Mantém o mesmo código da versão anterior, apenas usando df_completo
-# ============================================================================
-
-# [O código das outras páginas permanece o mesmo, apenas usando df_completo]
-# Por brevidade, não vou repetir todo o código aqui, mas ele seria idêntico
 
 # ============================================================================
 # FOOTER
@@ -768,9 +663,7 @@ elif pagina == "📉 Variáveis Quantitativas":
 st.markdown("---")
 st.markdown(f"""
 <div style="text-align: center; color: #7f8c8d; padding: 2rem 0;">
-    <p><strong>Dashboard de Análise Exploratória - ENEM 2024</strong></p>
-    <p>Desenvolvido com ❤️ usando Streamlit, Polars e Plotly</p>
-    <p><em>Dados: PostgreSQL - bigdata.dataiesb.com</em></p>
-    <p><em>Total de registros carregados: {len(df_completo):,}</em></p>
+    <p><strong>Dashboard ENEM 2024</strong> | Desenvolvido com Streamlit + Polars + PostgreSQL</p>
+    <p><em>Dados carregados: {len(df_completo):,} registros</em></p>
 </div>
 """, unsafe_allow_html=True)
