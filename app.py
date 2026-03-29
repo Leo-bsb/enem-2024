@@ -391,11 +391,15 @@ def amostra_sistematica(df: pl.DataFrame, taxa: float = TAXA, seed: int = SEED) 
     k = N/n  →  sorteia ponto de partida em [0, k-1] e retira 1 a cada k elementos.
     """
     N = len(df)
-    n = math.ceil(N * taxa)
-    k = max(1, N // n)
+    if N == 0:
+        return df
+
+    n = max(1, math.ceil(N * taxa))   # garante n >= 1
+    k = max(1, N // n)                # garante k >= 1, sem divisão por zero
 
     rng = np.random.default_rng(seed)
-    inicio = int(rng.integers(0, k))
+    # rng.integers(low, high) → high é exclusivo; se k==1 usamos 0 direto
+    inicio = int(rng.integers(0, k)) if k > 1 else 0
 
     indices = list(range(inicio, N, k))[:n]
     return df[indices]
