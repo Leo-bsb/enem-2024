@@ -449,19 +449,45 @@ def amostra_estratificada(df: pl.DataFrame, taxa: float = TAXA, seed: int = SEED
 # ============================================================================
 
 def estatisticas_numericas(df: pl.DataFrame, label: str) -> dict:
-    """Calcula estatísticas descritivas das variáveis numéricas."""
+    """Calcula estatísticas descritivas das variáveis numéricas.
+    Retorna 0.0 para qualquer estatística que resulte em None
+    (coluna vazia ou totalmente nula após drop_nulls).
+    """
+    def safe(val) -> float:
+        """Converte para float, retornando 0.0 se None ou NaN."""
+        if val is None:
+            return 0.0
+        try:
+            f = float(val)
+            return 0.0 if math.isnan(f) else f
+        except (TypeError, ValueError):
+            return 0.0
+
     out = {"label": label, "n": len(df)}
     for v in VARIAVEIS_NUM:
+        if v not in df.columns:
+            out[v] = {k: 0.0 for k in ["mean","median","std","min","max","q1","q3","cv"]}
+            continue
+
         col = df[v].drop_nulls()
+
+        if len(col) == 0:
+            out[v] = {k: 0.0 for k in ["mean","median","std","min","max","q1","q3","cv"]}
+            continue
+
+        mean_val = safe(col.mean())
+        std_val  = safe(col.std())
+        cv_val   = round(std_val / mean_val * 100, 4) if mean_val != 0 else 0.0
+
         out[v] = {
-            "mean":   round(float(col.mean()), 4),
-            "median": round(float(col.median()), 4),
-            "std":    round(float(col.std()), 4),
-            "min":    round(float(col.min()), 4),
-            "max":    round(float(col.max()), 4),
-            "q1":     round(float(col.quantile(0.25)), 4),
-            "q3":     round(float(col.quantile(0.75)), 4),
-            "cv":     round(float(col.std() / col.mean() * 100), 4) if col.mean() != 0 else 0,
+            "mean":   round(mean_val, 4),
+            "median": round(safe(col.median()), 4),
+            "std":    round(std_val, 4),
+            "min":    round(safe(col.min()), 4),
+            "max":    round(safe(col.max()), 4),
+            "q1":     round(safe(col.quantile(0.25)), 4),
+            "q3":     round(safe(col.quantile(0.75)), 4),
+            "cv":     cv_val,
         }
     return out
 
