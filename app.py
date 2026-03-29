@@ -410,20 +410,38 @@ def amostra_estratificada(df: pl.DataFrame, taxa: float = TAXA, seed: int = SEED
     Amostragem Estratificada proporcional por tp_sexo × tp_cor_raca.
     Garante representação proporcional de cada estrato.
     """
+    if len(df) == 0:
+        return df
+
+    # Cast seguro: funciona com Categorical, Utf8 ou qualquer tipo
+    def to_str(col_name: str) -> pl.Expr:
+        return (
+            pl.col(col_name)
+            .cast(pl.Utf8, strict=False)
+            .fill_null("ND")
+        )
+
     estratos = df.with_columns(
-        (pl.col("tp_sexo").cast(pl.Utf8) + "_" + pl.col("tp_cor_raca").cast(pl.Utf8)).alias("_estrato")
+        (to_str("tp_sexo") + "_" + to_str("tp_cor_raca")).alias("_estrato")
     )
 
     partes = []
     rng = np.random.default_rng(seed)
 
-    for estrato_val, grupo in estratos.group_by("_estrato"):
+    for _estrato_val, grupo in estratos.group_by("_estrato"):
+        if len(grupo) == 0:
+            continue
         n_estrato = max(1, math.ceil(len(grupo) * taxa))
         seed_local = int(rng.integers(0, 2**31))
-        partes.append(grupo.sample(n=min(n_estrato, len(grupo)), seed=seed_local, shuffle=True))
+        partes.append(
+            grupo.sample(n=min(n_estrato, len(grupo)), seed=seed_local, shuffle=True)
+        )
 
-    resultado = pl.concat(partes).drop("_estrato")
-    return resultado
+    # Fallback: se nenhum estrato foi gerado, usa amostragem aleatória simples
+    if not partes:
+        return amostra_aleatoria_simples(df, taxa=taxa, seed=seed)
+
+    return pl.concat(partes).drop("_estrato")
 
 
 # ============================================================================
