@@ -321,48 +321,87 @@ def get_engine():
 @st.cache_data(ttl=3600, show_spinner=False)
 def carregar_populacao():
     """
-    Carrega até 200.000 registros do banco — esse conjunto tratamos como
-    a 'população' do estudo. As três técnicas de amostragem retirarão
-    20% desse total.
+    Carrega até 200.000 registros APENAS da tabela de resultados.
+    Não há chave comum entre participantes e resultados, então usamos
+    só ed_enem_2024_resultados, que já contém as notas necessárias.
     """
     engine = get_engine()
     if engine is None:
         return None
 
-    query = """
-    SELECT
-        p.nu_inscricao,
-        p.tp_sexo,
-        p.tp_faixa_etaria,
-        p.tp_cor_raca,
-        p.sg_uf_prova,
-        p.q001            AS renda_familiar,
-        r.nota_mt_matematica,
-        r.nota_redacao,
-        r.nota_media_5_notas
-    FROM public.ed_enem_2024_participantes p
-    INNER JOIN public.ed_enem_2024_resultados r
-        ON p.nu_inscricao = r.nu_sequencial
-    WHERE r.nota_media_5_notas IS NOT NULL
-      AND r.nota_mt_matematica IS NOT NULL
-      AND r.nota_redacao IS NOT NULL
-    LIMIT 200000
-    """
+    bar = st.progress(0, text="🔍 Inspecionando colunas disponíveis...")
 
-    bar = st.progress(0, text="📥 Carregando dados do banco...")
     try:
+        # 1. Descobrir colunas disponíveis na tabela de resultados
+        with engine.connect() as conn:
+            result = conn.execute(text("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name   = 'ed_enem_2024_resultados'
+                ORDER BY ordinal_position
+            """))
+            colunas_disponiveis = [row[0] for row in result]
+
+        bar.progress(20, text=f"✅ {len(colunas_disponiveis)} colunas encontradas")
+
+        # 2. Colunas numéricas de notas — pegamos as que existirem
+        candidatas_num = [
+            "nota_mt_matematica", "nota_redacao", "nota_media_5_notas",
+            "nota_ch_ciencias_humanas", "nota_cn_ciencias_natureza",
+            "nota_lc_linguagens", "nu_nota_mt", "nu_nota_redacao",
+        ]
+        colunas_num = [c for c in candidatas_num if c in colunas_disponiveis]
+
+        # 3. Colunas categóricas — pegamos as que existirem
+        candidatas_cat = [
+            "tp_sexo", "tp_faixa_etaria", "tp_cor_raca",
+            "sg_uf_prova", "tp_presenca_mt", "tp_presenca_lc",
+            "tp_status_redacao",
+        ]
+        colunas_cat = [c for c in candidatas_cat if c in colunas_disponiveis]
+
+        if not colunas_num:
+            st.error("❌ Nenhuma coluna de nota reconhecida na tabela de resultados.")
+            st.markdown(f"**Colunas disponíveis:** {', '.join(colunas_disponiveis[:30])}")
+            bar.empty()
+            return None
+
+        # 4. Montar SELECT com as colunas disponíveis
+        todas_cols = list(dict.fromkeys(colunas_num + colunas_cat))
+        select_cols = ", ".join(todas_cols)
+
+        # Filtro: pelo menos uma nota não nula
+        where_clause = " OR ".join([f"{c} IS NOT NULL" for c in colunas_num[:3]])
+
+        query = f"""
+        SELECT {select_cols}
+        FROM public.ed_enem_2024_resultados
+        WHERE {where_clause}
+        LIMIT 200000
+        """
+
+        bar.progress(40, text="📥 Carregando dados da tabela de resultados...")
         df = pl.read_database(query=query, connection=engine)
-        bar.progress(70, text="⚙️ Processando tipos...")
+        bar.progress(75, text="⚙️ Otimizando tipos de dados...")
 
-        # Tipos
-        cat_cols = ["tp_sexo", "tp_faixa_etaria", "tp_cor_raca", "sg_uf_prova", "renda_familiar"]
-        for c in cat_cols:
-            if c in df.columns and df[c].dtype == pl.Utf8:
-                df = df.with_columns(pl.col(c).cast(pl.Categorical))
+        # Cast categóricas
+        for c in colunas_cat:
+            if c in df.columns:
+                df = df.with_columns(
+                    pl.col(c).cast(pl.Utf8, strict=False).cast(pl.Categorical)
+                )
 
-        bar.progress(100, text=f"✅ {len(df):,} registros carregados!")
+        # Garantir que as variáveis numéricas globais existam no df
+        # (atualiza VARIAVEIS_NUM e VARIAVEIS_CAT conforme o que foi carregado)
+        global VARIAVEIS_NUM, VARIAVEIS_CAT
+        VARIAVEIS_NUM = [c for c in colunas_num if c in df.columns]
+        VARIAVEIS_CAT = [c for c in colunas_cat if c in df.columns]
+
+        bar.progress(100, text=f"✅ {len(df):,} registros · {len(df.columns)} colunas")
         bar.empty()
         return df
+
     except Exception as e:
         bar.empty()
         st.error(f"❌ Erro ao carregar dados: {e}")
@@ -376,7 +415,9 @@ def carregar_populacao():
 TAXA = 0.20   # 20%
 SEED = 42
 VARIAVEIS_NUM = ["nota_mt_matematica", "nota_redacao", "nota_media_5_notas"]
-VARIAVEIS_CAT = ["tp_sexo", "tp_cor_raca", "sg_uf_prova", "renda_familiar"]
+VARIAVEIS_CAT = ["tp_sexo", "tp_cor_raca", "sg_uf_prova", "renda_familiar"]  # atualizado em runtime
+ESTRATO_COL1  = "tp_sexo"    # atualizado após carregamento
+ESTRATO_COL2  = "tp_cor_raca"  # atualizado após carregamento
 
 
 def amostra_aleatoria_simples(df: pl.DataFrame, taxa: float = TAXA, seed: int = SEED) -> pl.DataFrame:
@@ -407,11 +448,25 @@ def amostra_sistematica(df: pl.DataFrame, taxa: float = TAXA, seed: int = SEED) 
 
 def amostra_estratificada(df: pl.DataFrame, taxa: float = TAXA, seed: int = SEED) -> pl.DataFrame:
     """
-    Amostragem Estratificada proporcional por tp_sexo × tp_cor_raca.
-    Garante representação proporcional de cada estrato.
+    Amostragem Estratificada proporcional.
+    Usa as duas primeiras colunas categóricas disponíveis como estratos.
     """
     if len(df) == 0:
         return df
+
+    global ESTRATO_COL1, ESTRATO_COL2
+
+    # Escolher colunas de estrato dinamicamente
+    cats_disponiveis = [c for c in VARIAVEIS_CAT if c in df.columns]
+    col1 = cats_disponiveis[0] if len(cats_disponiveis) > 0 else None
+    col2 = cats_disponiveis[1] if len(cats_disponiveis) > 1 else col1
+
+    if col1 is None:
+        # Sem coluna categórica: usa amostragem simples
+        return amostra_aleatoria_simples(df, taxa=taxa, seed=seed)
+
+    ESTRATO_COL1 = col1
+    ESTRATO_COL2 = col2
 
     # Cast seguro: funciona com Categorical, Utf8 ou qualquer tipo
     def to_str(col_name: str) -> pl.Expr:
@@ -422,7 +477,7 @@ def amostra_estratificada(df: pl.DataFrame, taxa: float = TAXA, seed: int = SEED
         )
 
     estratos = df.with_columns(
-        (to_str("tp_sexo") + "_" + to_str("tp_cor_raca")).alias("_estrato")
+        (to_str(col1) + "_" + to_str(col2)).alias("_estrato")
     )
 
     partes = []
@@ -1010,15 +1065,22 @@ elif pagina == "📏 Sistemática":
 # ============================================================================
 
 elif pagina == "🗂️ Estratificada":
-    st.markdown("""
+    # Colunas de estrato usadas (definidas dinamicamente em amostra_estratificada)
+    ec1 = ESTRATO_COL1
+    ec2 = ESTRATO_COL2
+    lbl_ec1 = ec1.replace("tp_", "").replace("_", " ").title()
+    lbl_ec2 = ec2.replace("tp_", "").replace("_", " ").title()
+    subtitulo_est = f"Proporcional por {lbl_ec1} × {lbl_ec2}"
+
+    st.markdown(f"""
     <div class="main-title">Estratificada</div>
-    <div class="main-subtitle">Proporcional por Sexo × Cor/Raça</div>
+    <div class="main-subtitle">{subtitulo_est}</div>
     """, unsafe_allow_html=True)
 
     st.markdown(f"""
     <div class="info-box">
     <strong>Como funciona:</strong> A população é dividida em estratos formados pela combinação
-    <strong>tp_sexo × tp_cor_raca</strong>. De cada estrato, retiramos {taxa_pct}% dos registros
+    <strong>{ec1} × {ec2}</strong>. De cada estrato, retiramos {taxa_pct}% dos registros
     proporcionalmente ao seu tamanho. Isso garante que grupos minoritários não sejam
     sub-representados na amostra. Total: <strong>{len(df_est):,} registros</strong>.
     </div>
@@ -1030,11 +1092,15 @@ elif pagina == "🗂️ Estratificada":
     with c2:
         st.markdown(card_metrica("N AMOSTRA", f"{len(df_est):,}".replace(",","."), "amber"), unsafe_allow_html=True)
     with c3:
-        # Contar estratos
-        n_estratos = (df_pop
-            .with_columns((pl.col("tp_sexo").cast(pl.Utf8) + "_" + pl.col("tp_cor_raca").cast(pl.Utf8)).alias("e"))
-            ["e"].n_unique())
-        st.markdown(card_metrica("ESTRATOS", f"{n_estratos}", "amber", "sexo × raça"), unsafe_allow_html=True)
+        try:
+            n_estratos = (df_pop
+                .with_columns(
+                    (pl.col(ec1).cast(pl.Utf8, strict=False).fill_null("ND") + "_" +
+                     pl.col(ec2).cast(pl.Utf8, strict=False).fill_null("ND")).alias("_e"))
+                ["_e"].n_unique())
+        except Exception:
+            n_estratos = "—"
+        st.markdown(card_metrica("ESTRATOS", f"{n_estratos}", "amber", f"{lbl_ec1} × {lbl_ec2}"), unsafe_allow_html=True)
     with c4:
         err = erro_relativo(pop_stats[variavel_analise]["mean"], est_stats[variavel_analise]["mean"])
         st.markdown(card_metrica("ERRO RELATIVO MÉDIA", f"{err:.3f}%", "amber"), unsafe_allow_html=True)
@@ -1063,44 +1129,46 @@ elif pagina == "🗂️ Estratificada":
     with tab4:
         st.markdown('<div class="section-header">🗂️ Distribuição por Estrato</div>', unsafe_allow_html=True)
 
-        df_pop_e = (df_pop
-            .with_columns([
-                pl.col("tp_sexo").cast(pl.Utf8).alias("Sexo"),
-                pl.col("tp_cor_raca").cast(pl.Utf8).alias("Cor/Raça"),
-            ])
-            .group_by(["Sexo", "Cor/Raça"])
-            .agg(pl.len().alias("N Pop."))
-            .sort("N Pop.", descending=True)
-        )
+        try:
+            df_pop_e = (df_pop
+                .with_columns([
+                    pl.col(ec1).cast(pl.Utf8, strict=False).fill_null("ND").alias(lbl_ec1),
+                    pl.col(ec2).cast(pl.Utf8, strict=False).fill_null("ND").alias(lbl_ec2),
+                ])
+                .group_by([lbl_ec1, lbl_ec2])
+                .agg(pl.len().alias("N Pop."))
+                .sort("N Pop.", descending=True)
+            )
 
-        df_est_e = (df_est
-            .with_columns([
-                pl.col("tp_sexo").cast(pl.Utf8).alias("Sexo"),
-                pl.col("tp_cor_raca").cast(pl.Utf8).alias("Cor/Raça"),
-            ])
-            .group_by(["Sexo", "Cor/Raça"])
-            .agg(pl.len().alias("N Amostra"))
-            .sort("N Amostra", descending=True)
-        )
+            df_est_e = (df_est
+                .with_columns([
+                    pl.col(ec1).cast(pl.Utf8, strict=False).fill_null("ND").alias(lbl_ec1),
+                    pl.col(ec2).cast(pl.Utf8, strict=False).fill_null("ND").alias(lbl_ec2),
+                ])
+                .group_by([lbl_ec1, lbl_ec2])
+                .agg(pl.len().alias("N Amostra"))
+                .sort("N Amostra", descending=True)
+            )
 
-        df_estratos = df_pop_e.join(df_est_e, on=["Sexo", "Cor/Raça"], how="left").to_pandas()
-        total_pop = df_estratos["N Pop."].sum() or 1
-        total_am  = df_estratos["N Amostra"].sum() or 1
-        df_estratos["% Pop."]    = (df_estratos["N Pop."]    / total_pop * 100).round(2)
-        df_estratos["% Amostra"] = (df_estratos["N Amostra"] / total_am  * 100).round(2)
-        df_estratos["Δ %"] = (df_estratos["% Amostra"] - df_estratos["% Pop."]).round(3)
+            df_estratos = df_pop_e.join(df_est_e, on=[lbl_ec1, lbl_ec2], how="left").to_pandas()
+            total_pop = df_estratos["N Pop."].sum() or 1
+            total_am  = df_estratos["N Amostra"].sum() or 1
+            df_estratos["% Pop."]    = (df_estratos["N Pop."]    / total_pop * 100).round(2)
+            df_estratos["% Amostra"] = (df_estratos["N Amostra"] / total_am  * 100).round(2)
+            df_estratos["Δ %"] = (df_estratos["% Amostra"] - df_estratos["% Pop."]).round(3)
+            st.dataframe(df_estratos, use_container_width=True, hide_index=True)
 
-        st.dataframe(df_estratos, use_container_width=True, hide_index=True)
-
-        fig_e = px.bar(
-            df_estratos.sort_values("N Pop.", ascending=False),
-            x="Cor/Raça", y=["N Pop.", "N Amostra"],
-            facet_col="Sexo", barmode="group",
-            color_discrete_map={"N Pop.": COLORS["populacao"], "N Amostra": COLORS["estratificada"]},
-            title="Tamanho dos Estratos: População vs Amostra",
-        )
-        fig_e.update_layout(**PLOT_TEMPLATE["layout"])
-        st.plotly_chart(fig_e, use_container_width=True)
+            fig_e = px.bar(
+                df_estratos.sort_values("N Pop.", ascending=False),
+                x=lbl_ec2, y=["N Pop.", "N Amostra"],
+                facet_col=lbl_ec1, barmode="group",
+                color_discrete_map={"N Pop.": COLORS["populacao"], "N Amostra": COLORS["estratificada"]},
+                title=f"Tamanho dos Estratos: População vs Amostra ({lbl_ec1} × {lbl_ec2})",
+            )
+            fig_e.update_layout(**PLOT_TEMPLATE["layout"])
+            st.plotly_chart(fig_e, use_container_width=True)
+        except Exception as e_est:
+            st.warning(f"Não foi possível montar o gráfico de estratos: {e_est}")
 
 
 # ============================================================================
