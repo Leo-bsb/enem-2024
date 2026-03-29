@@ -609,14 +609,26 @@ pagina = st.sidebar.radio(
 
 st.sidebar.markdown("---")
 
+# Mapa de labels legíveis — funciona para qualquer nome de coluna
+LABEL_MAP = {
+    "nota_mt_matematica":       "Matemática",
+    "nota_redacao":             "Redação",
+    "nota_media_5_notas":       "Nota Média (5 provas)",
+    "nota_ch_ciencias_humanas": "Ciências Humanas",
+    "nota_cn_ciencias_natureza":"Ciências Natureza",
+    "nota_lc_linguagens":       "Linguagens",
+    "nu_nota_mt":               "Matemática (nu)",
+    "nu_nota_redacao":          "Redação (nu)",
+}
+
+def col_label(col: str) -> str:
+    """Retorna label legível; se não conhecer, formata o nome da coluna."""
+    return LABEL_MAP.get(col, col.replace("_", " ").title())
+
 variavel_analise = st.sidebar.selectbox(
     "VARIÁVEL NUMÉRICA",
     VARIAVEIS_NUM,
-    format_func=lambda x: {
-        "nota_mt_matematica": "Matemática",
-        "nota_redacao": "Redação",
-        "nota_media_5_notas": "Nota Média (5 provas)",
-    }[x],
+    format_func=col_label,
 )
 
 taxa_pct = st.sidebar.slider("TAXA DE AMOSTRAGEM (%)", 5, 40, 20, 5)
@@ -675,8 +687,7 @@ sist_stats = estatisticas_numericas(df_sist, "Sistemática")
 est_stats  = estatisticas_numericas(df_est,  "Estratificada")
 todas_amostras = [aas_stats, sist_stats, est_stats]
 
-var_label = {"nota_mt_matematica": "Matemática", "nota_redacao": "Redação",
-             "nota_media_5_notas": "Nota Média"}[variavel_analise]
+var_label = col_label(variavel_analise)
 
 # ============================================================================
 # HELPERS DE PLOT
@@ -902,11 +913,7 @@ if pagina == "🏠 Visão Geral":
     rows_resumo = []
     for v in VARIAVEIS_NUM:
         rows_resumo.append({
-            "Variável": var_label if v == variavel_analise else {
-                "nota_mt_matematica": "Matemática",
-                "nota_redacao": "Redação",
-                "nota_media_5_notas": "Nota Média",
-            }[v],
+            "Variável": col_label(v),
             "População": pop_stats[v]["mean"],
             "Aleatória Simples": aas_stats[v]["mean"],
             "Sistemática": sist_stats[v]["mean"],
