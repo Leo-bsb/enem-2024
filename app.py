@@ -809,7 +809,7 @@ def render_tabela_comparacao(pop_s, amostras_s, variavel):
         "color": "#f1f5f9",
         "border-color": "#1e293b",
     })
-    st.dataframe(df_cmp, use_container_width=True, hide_index=True)
+    st.dataframe(df_cmp, width='stretch', hide_index=True)
 
 
 # ============================================================================
@@ -922,7 +922,7 @@ if pagina == "🏠 Visão Geral":
             "Δ Sist (%)": round(erro_relativo(pop_stats[v]["mean"], sist_stats[v]["mean"]), 3),
             "Δ Est (%)": round(erro_relativo(pop_stats[v]["mean"], est_stats[v]["mean"]), 3),
         })
-    st.dataframe(pd.DataFrame(rows_resumo), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows_resumo), width='stretch', hide_index=True)
 
     # Radar geral
     st.markdown("<br>", unsafe_allow_html=True)
@@ -1134,50 +1134,81 @@ elif pagina == "🗂️ Estratificada":
         render_tabela_comparacao(pop_stats, [est_stats], variavel_analise)
 
     with tab4:
-        st.markdown('<div class="section-header">🗂️ Distribuição por Estrato</div>', unsafe_allow_html=True)
-
-        try:
-            df_pop_e = (df_pop
-                .with_columns([
-                    pl.col(ec1).cast(pl.Utf8, strict=False).fill_null("ND").alias(lbl_ec1),
-                    pl.col(ec2).cast(pl.Utf8, strict=False).fill_null("ND").alias(lbl_ec2),
-                ])
-                .group_by([lbl_ec1, lbl_ec2])
-                .agg(pl.len().alias("N Pop."))
-                .sort("N Pop.", descending=True)
-            )
-
-            df_est_e = (df_est
-                .with_columns([
-                    pl.col(ec1).cast(pl.Utf8, strict=False).fill_null("ND").alias(lbl_ec1),
-                    pl.col(ec2).cast(pl.Utf8, strict=False).fill_null("ND").alias(lbl_ec2),
-                ])
-                .group_by([lbl_ec1, lbl_ec2])
-                .agg(pl.len().alias("N Amostra"))
-                .sort("N Amostra", descending=True)
-            )
-
-            df_estratos = df_pop_e.join(df_est_e, on=[lbl_ec1, lbl_ec2], how="left").to_pandas()
-            total_pop = df_estratos["N Pop."].sum() or 1
-            total_am  = df_estratos["N Amostra"].sum() or 1
-            df_estratos["% Pop."]    = (df_estratos["N Pop."]    / total_pop * 100).round(2)
-            df_estratos["% Amostra"] = (df_estratos["N Amostra"] / total_am  * 100).round(2)
-            df_estratos["Δ %"] = (df_estratos["% Amostra"] - df_estratos["% Pop."]).round(3)
-            st.dataframe(df_estratos, use_container_width=True, hide_index=True)
-
-            fig_e = px.bar(
-                df_estratos.sort_values("N Pop.", ascending=False),
-                x=lbl_ec2, y=["N Pop.", "N Amostra"],
-                facet_col=lbl_ec1, barmode="group",
-                color_discrete_map={"N Pop.": COLORS["populacao"], "N Amostra": COLORS["estratificada"]},
-                title=f"Tamanho dos Estratos: População vs Amostra ({lbl_ec1} × {lbl_ec2})",
-            )
-            fig_e.update_layout(**PLOT_TEMPLATE["layout"])
-            st.plotly_chart(fig_e, use_container_width=True)
-        except Exception as e_est:
-            st.warning(f"Não foi possível montar o gráfico de estratos: {e_est}")
-
-
+            st.markdown('<div class="section-header">🗂️ Distribuição por Estrato</div>', unsafe_allow_html=True)
+    
+            try:
+                # Se ec1 == ec2 (só uma col categórica disponível), usa apenas uma dimensão
+                usar_dois_estratos = (ec1 != ec2)
+    
+                if usar_dois_estratos:
+                    group_cols_pop = [lbl_ec1, lbl_ec2]
+                    group_cols_est = [lbl_ec1, lbl_ec2]
+                    with_cols_pop = [
+                        pl.col(ec1).cast(pl.Utf8, strict=False).fill_null("ND").alias(lbl_ec1),
+                        pl.col(ec2).cast(pl.Utf8, strict=False).fill_null("ND").alias(lbl_ec2),
+                    ]
+                    with_cols_est = with_cols_pop
+                else:
+                    group_cols_pop = [lbl_ec1]
+                    group_cols_est = [lbl_ec1]
+                    with_cols_pop = [
+                        pl.col(ec1).cast(pl.Utf8, strict=False).fill_null("ND").alias(lbl_ec1),
+                    ]
+                    with_cols_est = with_cols_pop
+    
+                df_pop_e = (
+                    df_pop
+                    .with_columns(with_cols_pop)
+                    .group_by(group_cols_pop)
+                    .agg(pl.len().alias("N Pop."))
+                    .sort("N Pop.", descending=True)
+                )
+    
+                df_est_e = (
+                    df_est
+                    .with_columns(with_cols_est)
+                    .group_by(group_cols_est)
+                    .agg(pl.len().alias("N Amostra"))
+                    .sort("N Amostra", descending=True)
+                )
+    
+                df_estratos = df_pop_e.join(df_est_e, on=group_cols_pop, how="left").to_pandas()
+                total_pop = df_estratos["N Pop."].sum() or 1
+                total_am  = df_estratos["N Amostra"].sum() or 1
+                df_estratos["% Pop."]    = (df_estratos["N Pop."]    / total_pop * 100).round(2)
+                df_estratos["% Amostra"] = (df_estratos["N Amostra"] / total_am  * 100).round(2)
+                df_estratos["Δ %"] = (df_estratos["% Amostra"] - df_estratos["% Pop."]).round(3)
+                st.dataframe(df_estratos, width='stretch', hide_index=True)
+    
+                if usar_dois_estratos:
+                    fig_e = px.bar(
+                        df_estratos.sort_values("N Pop.", ascending=False),
+                        x=lbl_ec2, y=["N Pop.", "N Amostra"],
+                        facet_col=lbl_ec1, barmode="group",
+                        color_discrete_map={
+                            "N Pop.": COLORS["populacao"],
+                            "N Amostra": COLORS["estratificada"],
+                        },
+                        title=f"Tamanho dos Estratos: Pop. vs Amostra ({lbl_ec1} × {lbl_ec2})",
+                    )
+                else:
+                    fig_e = px.bar(
+                        df_estratos.sort_values("N Pop.", ascending=False),
+                        x=lbl_ec1, y=["N Pop.", "N Amostra"],
+                        barmode="group",
+                        color_discrete_map={
+                            "N Pop.": COLORS["populacao"],
+                            "N Amostra": COLORS["estratificada"],
+                        },
+                        title=f"Tamanho dos Estratos: Pop. vs Amostra ({lbl_ec1})",
+                    )
+    
+                fig_e.update_layout(**PLOT_TEMPLATE["layout"])
+                st.plotly_chart(fig_e, use_container_width=True)
+    
+            except Exception as e_est:
+                st.warning(f"Não foi possível montar o gráfico de estratos: {e_est}")
+    
 # ============================================================================
 # PÁGINA: COMPARAÇÃO GERAL
 # ============================================================================
