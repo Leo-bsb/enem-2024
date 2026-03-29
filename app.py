@@ -595,6 +595,19 @@ if df_pop is None:
     st.error("Não foi possível carregar os dados.")
     st.stop()
 
+if len(df_pop) == 0:
+    st.error("⚠️ O banco retornou 0 registros.")
+    st.markdown("""
+    **Possíveis causas:**
+    - As tabelas `ed_enem_2024_participantes` / `ed_enem_2024_resultados` não existem ou estão vazias
+    - O JOIN entre `nu_inscricao` e `nu_sequencial` não encontrou correspondências
+    - Os filtros `WHERE nota_media_5_notas IS NOT NULL` eliminaram todos os registros
+    - Problema de permissão no schema `public`
+
+    Clique em **🔄 Recarregar** na barra lateral ou verifique as credenciais em Settings → Secrets.
+    """)
+    st.stop()
+
 # Gerar as três amostras
 df_aas  = amostra_aleatoria_simples(df_pop, taxa=taxa, seed=seed_val)
 df_sist = amostra_sistematica(df_pop, taxa=taxa, seed=seed_val)
@@ -752,8 +765,9 @@ if pagina == "🏠 Visão Geral":
         st.markdown(card_metrica("ALEATÓRIA SIMPLES", f"{len(df_aas):,}".replace(",", "."),
                                  "cyan", f"{taxa_pct}% da pop."), unsafe_allow_html=True)
     with c3:
+        k_display = max(1, len(df_pop) // len(df_sist)) if len(df_sist) > 0 else "—"
         st.markdown(card_metrica("SISTEMÁTICA", f"{len(df_sist):,}".replace(",", "."),
-                                 "green", f"k = {max(1, len(df_pop) // len(df_sist))}"), unsafe_allow_html=True)
+                                 "green", f"k = {k_display}"), unsafe_allow_html=True)
     with c4:
         st.markdown(card_metrica("ESTRATIFICADA", f"{len(df_est):,}".replace(",", "."),
                                  "amber", "sexo × raça"), unsafe_allow_html=True)
@@ -933,7 +947,7 @@ elif pagina == "🎲 Aleatória Simples":
 elif pagina == "📏 Sistemática":
     N = len(df_pop)
     n_s = len(df_sist)
-    k = max(1, N // n_s)
+    k = max(1, N // n_s) if n_s > 0 else 1
 
     st.markdown("""
     <div class="main-title">Sistemática</div>
@@ -943,7 +957,7 @@ elif pagina == "📏 Sistemática":
     st.markdown(f"""
     <div class="info-box">
     <strong>Como funciona:</strong> Calculamos o intervalo de seleção
-    <strong>k = {k}</strong> (= {N:,} ÷ {n_s:,}).
+    <strong>k = {k}</strong> (= {N:,} ÷ {n_s if n_s > 0 else "—"}).
     Um ponto de partida aleatório entre 0 e {k-1} foi sorteado; a partir dele,
     selecionamos 1 elemento a cada {k} posições da lista.
     A amostra contém <strong>{n_s:,} registros</strong> ({taxa_pct}% da população).
@@ -1070,8 +1084,10 @@ elif pagina == "🗂️ Estratificada":
         )
 
         df_estratos = df_pop_e.join(df_est_e, on=["Sexo", "Cor/Raça"], how="left").to_pandas()
-        df_estratos["% Pop."] = (df_estratos["N Pop."] / df_estratos["N Pop."].sum() * 100).round(2)
-        df_estratos["% Amostra"] = (df_estratos["N Amostra"] / df_estratos["N Amostra"].sum() * 100).round(2)
+        total_pop = df_estratos["N Pop."].sum() or 1
+        total_am  = df_estratos["N Amostra"].sum() or 1
+        df_estratos["% Pop."]    = (df_estratos["N Pop."]    / total_pop * 100).round(2)
+        df_estratos["% Amostra"] = (df_estratos["N Amostra"] / total_am  * 100).round(2)
         df_estratos["Δ %"] = (df_estratos["% Amostra"] - df_estratos["% Pop."]).round(3)
 
         st.dataframe(df_estratos, use_container_width=True, hide_index=True)
